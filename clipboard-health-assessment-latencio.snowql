@@ -1,0 +1,214 @@
+/* Resources for both tasks:
+ - Snowflake, Zendesk API, and HEVO docs used for SQL syntax, Clipboard Health data pipeline & structure, and Zendesk data information (e.g. datatypes, column & table descriptors):
+ -- https://docs.snowflake.com/
+ -- https://developer.zendesk.com/api-reference/
+ -- https://docs.hevodata.com/destinations/data-warehouses/snowflake/snowflake-data-structure/
+
+*/
+
+
+/****************************************** TASK 1 SUMMARY ******************************************
+Create an SQL query to determine the average first reply time and average first resolution time by month for the past 12 months.
+
+Assumptions:
+    - Timezone is UTC unless specified (ZD_USERS table) per Zendesk policy.
+    - (ZD_Ticket_Metrics.CREATED_AT != ZD_Tickets.CREATED_AT)
+    - 
+    - Bracket notation used for nested JSON values for readability. 
+    - (Business hours = Calendar hours) for ticket metrics (Calendar hours optional in query), per Clipboard Health's 24/7 support policy:
+    -- https://www.clipboardhealth.com/about
+    - Definitions of first reply and first resolution time defined by Zendesk:
+    -- https://support.zendesk.com/hc/en-us/articles/4408834848154-About-native-Support-time-duration-metrics
+    -- https://support.zendesk.com/hc/en-us/articles/4408821871642-Understanding-ticket-reply-time#topic_jvw_nqd_1hb
+*/
+
+-- Setting the database and schema for the session for readability
+USE HEVO_DATABASE.MONGO_MAIN_APP
+GO -- Instead of ';' if required syntax to separate batches
+
+
+-- Prequalify the data in a cte before running aggregate operations to improve performance and extensibiity
+-- Ticket metrics past 12 months with reply OR resolution
+WITH monthly_metrics_prep AS (
+    SELECT
+        /*********************** REQUIRED START **********************/
+        -- ZD stores created_at as string, casting to date for time operations. +'_date' suffix to avoid using function name as alias
+        DATE_PART(month, t.created_at::DATE) AS month_date
+
+        -- _biz suffix checks against business hours set in ZD. Bracket notation used for nested JSON values:
+        , m.reply_time_in_minutes['business']::NUMBER AS first_reply_mins_biz
+        , m.first_resolution_time_in_minutes['business']::NUMBER AS first_resolution_time_mins_biz
+        /*********************** REQUIRED END **********************/
+
+        /*********************** OPTIONAL START *********************/ 
+        ---- ticket_id to extend EDA/investigation capabilities
+        -- , t.id::NUMBER AS ticket_id
+
+        ---- Ticket type to extend EDA/investigation capabilities
+        -- , t.type AS ticket_type
+
+        ---- Includes ONLY messaging tickets in seconds
+        -- , m.reply_time_in_seconds['calendar']::NUMBER AS first_reply_secs_msg
+
+        ---- _cal suffix calculated based on calendar time. Calendar optional to check consistency:
+        -- , m.reply_time_in_minutes['calendar']::NUMBER AS first_reply_mins_cal
+        -- , m.first_resolution_time_in_minutes['calendar']::NUMBER AS first_resolution_time_mins_cal
+        /********************** OPTIONAL END ***********************/
+    -- ASSUMPTION: (ZD_Ticket_Metrics.CREATED_AT != ZD_Tickets.CREATED_AT), using ZD_tickets table for ticket dates:
+    FROM ZD_tickets t
+        JOIN ZD_ticket_metrics m
+            ON t.id = m.ticket_id
+
+    -- Tickets in the past 12 months that have a reply OR resolution:
+    WHERE (DATE_TRUNC('month', t.created_at::DATE)) >= (DATEADD('month', -12, DATE_TRUNC('month', CURRENT_DATE())))
+        -- Ticket month is within the last 12 calendar months from current date
+        -- (DATE_TRUNC('month', t.created_at::DATE)) >= (DATEADD('month', -12, DATE_TRUNC('month', CURRENT_DATE())))
+
+        -- Remove new tickets, they don't have replies/resolutions. Used NOT IN for extensibility
+        AND t.status NOT IN ('new')
+
+        -- First Reply Time specific filters:
+        -- Filtering nulls, unsure if parses SQL NULL or JSON null; Casting to variant to use IS_INTEGER
+        AND (IS_INTEGER(m.reply_time_in_minutes['business']::VARIANT))
+
+        -- First Resolution Time specific filters:
+        -- Filtering nulls, unsure if parses SQL NULL or JSON null; Casting to variant to use IS_INTEGER
+        OR (IS_INTEGER(m.first_resolution_time_in_minutes['business']::VARIANT))
+) 
+
+
+
+-- Determine the average first reply time and average first resolution time by month for the past 12 months.
+SELECT
+    /*********************** REQUIRED START **********************/
+    m.month_date AS month_date
+    , AVG(m.first_reply_mins_biz) AS avg_first_reply_mins_biz
+    , AVG(m.first_resolution_time_mins_biz) AS avg_first_resolution_time_mins_biz
+    /*********************** REQUIRED END **********************/
+
+    /*********************** RECOMMENDED START **********************/
+    ---- Recommendation: Include median, max and 90th percentile to validate average and check for outliers:
+
+    ---- First Reply Time Business hours:
+    -- , MEDIAN(m.first_reply_mins_biz) AS median_first_reply_mins_biz
+    -- , MAX(m.first_reply_mins_biz) AS max_first_reply_mins_biz
+    -- , APPROX_PERCENTILE(m.first_reply_mins_biz, 0.9) AS _90p_first_reply_mins_biz
+
+    ---- First Resolution Time Business hours:
+    -- , MEDIAN(m.first_resolution_time_mins_biz) AS median_first_resolution_time_mins_biz
+    -- , MAX(m.first_resolution_time_mins_biz) AS max_first_resolution_time_mins_biz
+    -- , APPROX_PERCENTILE(m.first_resolution_time_mins_biz, 0.9) AS _90p_first_resolution_time_mins_biz
+    /*********************** RECOMMENDED END  **********************/
+    
+    /*********************** OPTIONAL START **********************/
+    ---- Ticket type to extend EDA/investigation capabilities - add to group by for metrics broken out by type
+    -- , m.type AS ticket_type
+
+    ---- First Reply Time Calendar Hours. Calendar optional to check consistency:
+    -- , AVG(m.first_reply_mins_cal) AS avg_first_reply_mins_cal
+    -- , MEDIAN(m.first_reply_mins_cal) AS median_first_reply_mins_cal
+    -- , MAX(m.first_reply_mins_cal) AS max_first_reply_mins_cal
+    -- , APPROX_PERCENTILE(m.first_reply_mins_cal, 0.9) AS _90p_first_reply_mins_cal
+
+    ---- First Resolution Time Calendar Hours. Calendar optional to check consistency:
+    -- , AVG(m.first_resolution_time_mins_cal) AS avg_first_resolution_time_mins_cal
+    -- , MEDIAN(m.first_resolution_time_mins_cal) AS median_first_resolution_time_mins_cal
+    -- , MAX(m.first_resolution_time_mins_cal) AS max_first_resolution_time_mins_cal
+    -- , APPROX_PERCENTILE(m.first_resolution_time_mins_cal, 0.9) AS _90p_first_resolution_time_mins_cal
+    
+    ---- Includes ONLY messaging tickets in seconds
+    -- , AVG(m.first_reply_secs_msg) AS avg_first_reply_secs_msg
+    -- , MEDIAN(m.first_reply_secs_msg) AS median_first_reply_secs_msg
+    -- , MAX(m.first_reply_secs_msg) AS max_first_reply_secs_msg
+    -- , APPROX_PERCENTILE(m.first_reply_secs_msg, 0.9) AS _90p_first_reply_secs_msg
+    /*********************** OPTIONAL END ***********************/
+FROM monthly_metrics_prep m
+GROUP BY 1
+ORDER BY 1
+;
+/****************************************** TASK 1 END ******************************************/
+
+
+/****************************************** TASK 2 SUMMARY ******************************************
+Create an SQL query that provides average satisfaction score (as calculated by Zendesk) and total tickets solved by agent by month for the last 6 months.
+
+Assumptions:
+ - Timezone is UTC unless specified (ZD_USERS table) per Zendesk
+ - Average satisfaction score (as calculated by Zendesk) calculated using formula: (D_COUNT(Good satisfaction tickets)/D_COUNT(Satisfaction Responses)) referenced here:
+ -- https://support.zendesk.com/hc/en-us/articles/4408822875930-Explore-recipe-Determining-satisfaction-scores-for-your-agents
+ - Overall satisfaction score calculated on all tickets
+*/
+
+-- Setting the database and schema for the session
+USE HEVO_DATABASE.MONGO_MAIN_APP
+GO -- Instead of ';' if required by syntax to separate batches
+
+
+-- Prequalify the data in a cte before running aggregate operations to improve performance and extensibiity
+-- Ticket metrics past 12 months with reply OR resolution
+WITH monthly_metrics_prep AS (
+    SELECT
+        /*********************** REQUIRED START **********************/
+        -- ZD stores created_at as string, casting to date for time operations. +'_date' suffix to avoid using function name as alias
+        DATE_PART(month, t.created_at::DATE) AS month_date
+
+        /*********************** REQUIRED END **********************/
+
+        /*********************** OPTIONAL START *********************/ 
+        ---- ticket_id to extend EDA/investigation capabilities
+        -- , t.id::NUMBER AS ticket_id
+
+        ---- Ticket type to extend EDA/investigation capabilities
+        -- , t.type AS ticket_type
+        /********************** OPTIONAL END ***********************/
+    -- Assuming (ZD_Ticket_Metrics.CREATED_AT != ZD_Tickets.CREATED_AT), using ZD_tickets table for ticket dates:
+    FROM ZD_tickets t
+        JOIN ZD_ticket_metrics m
+            ON t.id = m.ticket_id
+
+    -- Tickets in the past 12 months that have a reply OR resolution:
+    WHERE
+        -- Ticket month is within the last 12 calendar months from current date
+        (DATE_TRUNC('month', t.created_at::DATE)) >= (DATEADD('month', -12, DATE_TRUNC('month', CURRENT_DATE())))
+
+        -- Remove new tickets, they don't have replies/resolutions. Used NOT IN for extensibility
+        AND t.status NOT IN ('new')
+
+        -- First Reply Time specific filters:
+        -- Filtering nulls, unsure if parses SQL NULL or JSON null; Casting to variant to use IS_INTEGER
+        AND (IS_INTEGER(m.reply_time_in_minutes['business']::VARIANT))
+
+        -- First Resolution Time specific filters:
+        -- Filtering nulls, unsure if parses SQL NULL or JSON null; Casting to variant to use IS_INTEGER
+        OR (IS_INTEGER(m.first_resolution_time_in_minutes['business']::VARIANT))
+) 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+WITH 
+WITH AgentMetrics AS (
+    SELECT
+        DATE_TRUNC('month', ZD_Tickets.CREATED_AT) AS Month,
+        ZD_Users.NAME AS AgentName,
+        AVG(ZD_Tickets.SATISFACTION_RATING::DECIMAL) AS AvgSatisfactionScore,
+        COUNT(ZD_Tickets.ID) AS TotalTicketsSolved
+    FROM HEVO_DATABASE.MONGO_MAIN_APP.ZD_Tickets
+    JOIN HEVO_DATABASE.MONGO_MAIN_APP.ZD_Users
+        ON ZD_Tickets.ASSIGNEE_ID = ZD_Users.ID
+    WHERE ZD_Tickets.CREATED_AT >= CURRENT_DATE - INTERVAL '6 months'
+    GROUP BY Month, AgentName
+    ORDER BY Month, AgentName
+)
+SELECT * FROM AgentMetrics;
